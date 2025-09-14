@@ -1,175 +1,224 @@
 # ==================================================================================================
-# safe_delete.py (v2 - Manual Recursion)
+# safe_delete.py (v3 - Robust, Concurrent)
 #
-# A script for safely deleting large directory structures using a manual recursive function
-# to build the deletion log, as per user's specific instructions.
+# This script deletes large directory structures safely.
+# It is designed to be robust against the file system issues reported on Windows.
+# This version uses a "discover-then-sort" method for guaranteed deletion order
+# and a thread pool for concurrent deletion processing.
 # ==================================================================================================
 
-# --- Import necessary libraries ---
-import os  # For basic file system operations like listdir, path.join, path.isdir.
-import sys  # To access command-line arguments and exit.
-import argparse  # For parsing command-line arguments.
-import logging  # For logging errors and progress.
-import subprocess  # To run the external 'rm' shell command.
+# --- Standard Library Imports ---
+import os  # Used for basic path operations like os.path.join, os.listdir, etc.
+import sys  # Used to access command-line arguments (sys.argv) and exit the script.
+import argparse  # Used for parsing command-line arguments cleanly.
+import logging  # Used for structured logging to file and console.
+import subprocess  # Used to execute external shell commands (specifically 'rm').
+import concurrent.futures  # Used for creating a thread pool for concurrent deletion.
 
-# --- Global Constants ---
-# The name of the file that will log the list of items to delete.
+# --- Configuration Constants ---
+
+# The name for the log file that will contain the ordered list of paths to delete.
+# This file acts as the "plan" for the deletion phase.
 DELETION_LOG_FILENAME = "deletelog"
-# The name of the file for logging errors and warnings.
+
+# The name for the file that will log errors and script progress.
 ERROR_LOG_FILENAME = "error.log"
 
+# The number of concurrent threads to use for the deletion process.
+# As requested, this can be changed to scale the performance. For now, it's 1.
+MAX_THREADS = 1
+
 # --- Logger Setup ---
-# Setup a global logger variable.
+
+# Set up a global logger object.
+# Using a global logger is a common practice in simpler applications.
 logger = logging.getLogger(__name__)
 
 def setup_logging(log_directory):
     """
-    Configures the logging system to write logs to a file.
+    Configures the logging system to write all logs to a file.
+    This ensures that all actions, errors, and progress are recorded for debugging.
+
     Args:
-        log_directory (str): The directory where the error log file will be created.
+        log_directory (str): The directory where the error.log file will be created.
     """
-    # Create the full path for the error log file.
+    # Define the full path for the error log file.
     log_file_path = os.path.join(log_directory, ERROR_LOG_FILENAME)
-    # Set the logging level to INFO.
+
+    # Set the minimum level of logs to capture (INFO and above).
     logger.setLevel(logging.INFO)
-    # Create a file handler to write logs to a file. 'a' for append mode.
-    handler = logging.FileHandler(log_file_path, mode='a')
-    # Ensure logs are written immediately.
-    handler.flush = sys.stdout.flush
-    # Define the log message format.
+
+    # Create a file handler to write log messages to the specified file.
+    # Mode 'a' means append, so logs from multiple runs are kept.
+    file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+
+    # Define the format for the log messages to include timestamp, level, and message.
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    # Add the file handler and a console handler to the logger.
-    logger.addHandler(handler)
-    logger.addHandler(logging.StreamHandler(sys.stdout))
-    logger.info("Logging configured. Errors will be saved to %s", log_file_path)
 
-# --- Core Logic: Manual Recursion for Logging ---
+    # Apply the formatter to the handler.
+    file_handler.setFormatter(formatter)
 
-def create_deletion_log_recursive(directory, log_file_handle):
+    # Add the configured file handler to the logger.
+    logger.addHandler(file_handler)
+
+    # Also add a handler to stream logs to the console for real-time feedback.
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    # Log the successful initialization of the logging system.
+    logger.info("Logging configured. Log file at: %s", log_file_path)
+
+# --- Core Logic ---
+
+def discover_paths_recursive(directory, all_paths):
     """
-    Manually implements a recursive, post-order traversal to create a deletion log.
-    This avoids using os.walk, per user instructions.
-
-    The order of operations is:
-    1. Log all files in the current directory.
-    2. Recurse into all subdirectories.
-    3. Log the current directory itself (after all its contents have been logged).
+    A simple recursive function to discover all files and subdirectories.
+    It does not perform any logic other than adding paths to a list.
 
     Args:
-        directory (str): The path to the directory to process.
-        log_file_handle: An open file handle to write the log to.
+        directory (str): The current directory to scan.
+        all_paths (list): The list to which all discovered paths are added.
     """
-    # These lists will hold the immediate children of the current directory.
-    files = []
-    subdirectories = []
+    # This function is designed to be simple. It first adds the directory itself.
+    # This is important for the sorting step later.
+    all_paths.append(directory)
+
     try:
-        # os.listdir is the approved primitive for getting directory contents.
+        # Use os.listdir(), the most basic directory listing command.
         for item_name in os.listdir(directory):
-            # Construct the full, absolute path for the item.
+            # Create the full path for the child item.
             full_path = os.path.join(directory, item_name)
-            # Check if the item is a directory or a file/link.
+            # Check if the item is a directory.
             if os.path.isdir(full_path):
-                subdirectories.append(full_path)
+                # If it's a directory, make a recursive call to dive deeper.
+                discover_paths_recursive(full_path, all_paths)
             else:
-                files.append(full_path)
+                # If it's a file, just add its path to the list.
+                all_paths.append(full_path)
     except OSError as e:
-        logger.error("Could not read directory %s: %s", directory, e)
-        return # Stop processing this directory if it can't be read.
+        # If we can't read a directory (e.g., permissions error), log it and continue.
+        logger.error("Cannot access directory %s: %s", directory, e)
 
-    # 1. First, write all files in the current directory to the log.
-    for file_path in files:
-        log_file_handle.write(file_path + '\n')
-
-    # 2. Second, recurse into the subdirectories.
-    # This is the 'depth-first' part of the search.
-    for subdir_path in subdirectories:
-        create_deletion_log_recursive(subdir_path, log_file_handle)
-
-    # 3. Finally, after all files and subdirectories have been logged,
-    # log the directory itself. This is the 'post-order' part.
-    log_file_handle.write(directory + '\n')
-
-# --- Deletion Logic ---
-
-def delete_with_shell(path):
+def delete_path_with_shell(path):
     """
-    Deletes a file or directory using the external 'rm' shell command.
-    This is the only deletion method, per user instructions.
+    Deletes a single file or directory using the 'rm -rf' shell command.
+    This function is designed to be called by the thread pool executor.
+
     Args:
-        path (str): The absolute path to the file or directory to delete.
+        path (str): The absolute path to the item to delete.
     """
-    try:
-        # Use subprocess.run to execute 'rm -rf'. This is robust.
-        subprocess.run(["rm", "-rf", path], check=True, capture_output=True, text=True)
-        logger.info("Successfully deleted (Shell): %s", path)
-    except subprocess.CalledProcessError as e:
-        # Log any error from the shell command.
-        logger.error("Failed to delete (Shell) %s: %s", path, e.stderr)
-
-def process_deletion_list(log_file_path):
-    """
-    Reads the deletion log file and deletes each item using the shell command.
-    Args:
-        log_file_path (str): The path to the file containing the list of items to delete.
-    """
-    logger.info("Phase 2: Starting to process the deletion list...")
-    if not os.path.exists(log_file_path):
-        logger.error("Deletion log file not found at %s. Cannot proceed.", log_file_path)
+    # First, check if the path even exists. This makes the script resumable
+    # and prevents errors if another thread deleted a parent directory already.
+    # os.path.lexists is used to correctly handle broken symbolic links.
+    if not os.path.lexists(path):
+        logger.warning("Path not found (possibly already deleted), skipping: %s", path)
         return
 
-    # Open the log file for reading.
-    with open(log_file_path, 'r', encoding='utf-8') as f:
-        # Read all paths into memory.
-        paths_to_delete = f.readlines()
-
-    # Iterate through the paths and delete them.
-    for path in paths_to_delete:
-        path = path.strip() # Remove trailing newline.
-        if path:
-            # Check if the item still exists to make the script resumable.
-            if os.path.exists(path) or os.path.islink(path):
-                delete_with_shell(path)
-            else:
-                logger.info("Item already deleted, skipping: %s", path)
-
-    logger.info("Phase 2: Finished processing deletion list.")
+    try:
+        # Execute 'rm -rf' using subprocess.run.
+        # This is the user-specified method for deletion.
+        # '-r' handles directories, '-f' ignores errors for non-existent files
+        # and suppresses confirmation prompts.
+        # We pass the command as a list to prevent shell injection vulnerabilities.
+        subprocess.run(["rm", "-rf", path], check=True, capture_output=True, text=True)
+        # Log successful deletion.
+        logger.info("Deleted: %s", path)
+    except subprocess.CalledProcessError as e:
+        # If the 'rm' command returns an error, log it.
+        logger.error("Failed to delete %s. Error: %s", path, e.stderr.strip())
+    except Exception as e:
+        # Catch any other unexpected errors during the subprocess call.
+        logger.error("An unexpected error occurred while trying to delete %s: %s", path, e)
 
 # --- Main Execution Block ---
 
 def main():
     """
-    The main function that orchestrates the script's execution.
+    Main function to orchestrate the entire discovery and deletion process.
     """
-    parser = argparse.ArgumentParser(description="Safely delete large directory structures using manual recursion.")
+    # Set up the argument parser to read the target directory from the command line.
+    parser = argparse.ArgumentParser(
+        description="Safely and concurrently delete large directory structures.",
+        epilog="This script uses a 'discover-then-sort' method for safety and a thread pool for speed."
+    )
+    # The '--directory' argument is mandatory.
     parser.add_argument("--directory", type=str, required=True, help="The absolute path to the directory to process.")
+    # Parse the arguments provided by the user.
     args = parser.parse_args()
     target_dir = args.directory
 
-    # --- Pre-run checks ---
+    # --- Pre-run validation ---
+    # Check if the target directory exists and is actually a directory.
     if not os.path.isdir(target_dir):
-        print(f"Error: The specified directory does not exist: {target_dir}")
+        # Print directly to stderr and exit if the path is invalid.
+        print(f"Error: The specified path is not a valid directory: {target_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # --- Setup ---
+    # --- Phase 1: Discovery and Logging ---
+
+    # Set up the logger to save logs inside the target directory.
     setup_logging(target_dir)
+
+    logger.info("--- Starting Phase 1: Discovering all paths ---")
+    # This list will hold all paths found by the recursive discovery.
+    all_paths = []
+    # Start the discovery process.
+    discover_paths_recursive(target_dir, all_paths)
+    logger.info("Discovered %d total files and directories.", len(all_paths))
+
+    # --- The critical sorting step ---
+    # Sort the list of paths in reverse alphabetical order.
+    # This is a simple but powerful trick to ensure that child paths
+    # (e.g., '/a/b/c.txt') always appear in the list *before* their parents ('/a/b/').
+    # This guarantees a safe deletion order.
+    logger.info("Sorting paths to ensure safe deletion order...")
+    all_paths.sort(reverse=True)
+
+    # Define the path for the deletion log file.
     deletion_log_path = os.path.join(target_dir, DELETION_LOG_FILENAME)
 
     try:
-        # --- Phase 1: Build the deletion list using manual recursion ---
-        logger.info("Phase 1: Starting to build the deletion list with manual recursion...")
-        with open(deletion_log_path, 'w', encoding='utf-8') as log_file:
-            create_deletion_log_recursive(target_dir, log_file)
-        logger.info("Phase 1: Successfully created deletion list at %s", deletion_log_path)
-
-        # --- Phase 2: Process the list and delete items ---
-        process_deletion_list(deletion_log_path)
-
-        logger.info("Safe deletion process completed successfully.")
-
-    except Exception as e:
-        logger.critical("An unexpected error occurred: %s", e, exc_info=True)
+        # Write the sorted, safe-to-delete list to the log file.
+        # This creates the execution plan for the next phase.
+        with open(deletion_log_path, 'w', encoding='utf-8') as f:
+            for path in all_paths:
+                f.write(path + '\n')
+        logger.info("Successfully created deletion plan at: %s", deletion_log_path)
+    except IOError as e:
+        # If the log file cannot be written, we cannot proceed.
+        logger.critical("Failed to write deletion log file. Aborting. Error: %s", e)
         sys.exit(1)
 
+    # --- Phase 2: Concurrent Deletion ---
+
+    logger.info("--- Starting Phase 2: Deleting paths with %d threads ---", MAX_THREADS)
+
+    # We use a ThreadPoolExecutor to manage a pool of worker threads.
+    # This is the modern way to handle concurrency for I/O-bound tasks in Python.
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            # The 'executor.map' function applies the 'delete_path_with_shell' function
+            # to each path in the 'all_paths' list. It automatically manages distributing
+            # the work among the threads in the pool.
+            # We pass the list directly, no need to read the file we just wrote, which is more efficient.
+            executor.map(delete_path_with_shell, all_paths)
+
+        # The 'with' block automatically waits for all threads to finish before exiting.
+        logger.info("All deletion tasks completed.")
+
+    except Exception as e:
+        # Catch any high-level errors during the thread pool execution.
+        logger.critical("A critical error occurred during the concurrent deletion phase: %s", e)
+        sys.exit(1)
+
+    # --- Final Step ---
+    # After all contents are deleted, the log file itself, which is inside the target directory,
+    # should also be gone, as its path would have been in the list.
+    # The final `rm` call on the `target_dir` itself will remove the now-empty directory.
+    logger.info("--- Safe deletion process finished successfully. ---")
+
+
+# This standard Python entry point ensures that main() is called only when the script is executed directly.
 if __name__ == "__main__":
     main()

@@ -26,8 +26,11 @@ fi
 echo "Target Directory: \"$TARGET_DIR\""
 echo "Starting the safe deletion process..."
 
+# Make the script executable, as this can be a point of failure.
+chmod +x safe_delete.py
+
 # Execute the python script, passing the directory as a command-line argument.
 # The path is quoted to handle spaces correctly.
-python safe_delete.py --directory "$TARGET_DIR"
+python3 safe_delete.py --directory "$TARGET_DIR"
 
 echo "Script execution finished."
